@@ -1,204 +1,118 @@
-# CodeSync - Collaborative Interview Platform
+# CodeSync
 
-CodeSync is a real-time collaborative competitive programming and technical interview platform. It empowers interviewers to create dynamic coding environments, generate complex test cases on the fly without writing generator code, and observe candidates as they solve problems in real-time.
-
----
-
-## 🚀 Features at a Glance
-
-- **Role-Based Access**: Generates distinct `Interviewer` and `Candidate` URLs. Interviewers have elevated privileges.
-- **Collaborative Editor**: Real-time code synchronization using Monaco Editor (the editor powering VS Code) and WebSockets.
-- **Dynamic Test Case Generator (No-Code)**: Interviewers can define input structures (Variables, Arrays, Strings, Matrices, Trees, Graphs) using a React visual builder. The backend automatically translates this schema into C++ code utilizing `testlib.h` and natively compiles it to generate robust randomized test cases.
-- **Isolated Code Execution**: Executes candidate code against the generated test cases using the **Piston API** (a high-performance code execution engine).
-- **HackerRank-Style Evaluation**: Evaluates outputs against expected outputs, normalizes line endings automatically, and hides large test cases after the first three to prevent candidates from hardcoding solutions.
+CodeSync is a real-time technical interview platform built on the MERN stack. It lets interviewers set up a coding environment, generate test cases without writing any code, and watch the candidate work live. Both parties share the same editor state over WebSockets.
 
 ---
 
-## 🏗️ Architecture & Flow
+## How It Works
 
-The system is broken down into two main parts: a React/Vite Frontend and a Node.js/Express Backend. 
+The platform has two roles: **Interviewer** and **Candidate**. When a room is created, two separate access URLs are generated — one for each role. The interviewer gets full control over the problem setup, test generation, and execution. The candidate only sees the editor and their results.
 
-### 1. Room Creation Flow
-When an interviewer creates a room, they configure the environment (language, problems). 
-For the **Test Case Generation**:
-1. The frontend parses the visual input blocks (e.g., "Add Integer N", "Add Array A of size N") into a structured JSON schema.
-2. `generatorBuilder.ts` on the frontend transforms this schema into a raw C++ file string utilizing the industry-standard competitive programming library `testlib.h`.
-3. The string is sent to the backend endpoint (`POST /rooms/:code/generate-testcases`).
-4. The backend writes this code to a temporary `generator.cpp` file, compiles it natively using the host's GCC (`g++` via MSYS2 on Windows), and executes it `X` times to generate randomized inputs and expected outputs.
-5. The generated test cases are saved to MongoDB as part of the Room document.
+### Room and Test Case Setup
 
-### 2. Interview & Execution Flow
-1. Both users connect to the Room URL. The backend uses the UUID in the URL to determine if the user is an Interviewer or a Candidate.
-2. They are placed in a Socket.IO room. Code changes in the Monaco editor emit `code-change` events, which are broadcasted to keep both screens in sync.
-3. When the candidate hits "Run Code", a request is sent to `POST /rooms/:code/execute`.
-4. The backend pulls the candidate's code and fires it off to the **Piston API** (local or remote) alongside the standard input (stdin) for each generated test case concurrently.
-5. Outputs are retrieved, line endings are normalized (`\r\n` to `\n`), and the candidate's output is compared strictly against the generator's expected output. Results are synced back via WebSockets.
+The interviewer builds a problem using a visual input block editor. Each block represents a part of the input (an integer, an array, a string, etc.). When the interviewer submits the configuration, the frontend serializes these blocks into a structured JSON schema and sends it to the server.
 
----
+The server takes that schema and constructs a valid C++ source file using `testlib.h`, a standard competitive programming library for writing randomized input generators. The file is compiled using `g++` on the host machine and executed multiple times with different seeds to produce randomized test case inputs. A second C++ program (the validator) runs each input and produces the expected output. Both inputs and expected outputs are saved to the room document in MongoDB.
 
-## 💻 Tech Stack
+### Live Editor Sync
 
-### Frontend (Client)
-- **Framework**: React 18 with Vite for blazing-fast HMR and building.
-- **Styling**: Tailwind CSS for utility-first, highly responsive, and modern UI components.
-- **Icons**: `lucide-react` for beautiful, consistent SVG icons.
-- **Editor**: `@monaco-editor/react` for the powerful, syntax-highlighted code editing experience.
-- **Routing**: `react-router-dom` for client-side routing.
-- **State/Sockets**: Standard React Hooks paired with `socket.io-client` for real-time duplex communication.
+Both users connect to the same Socket.IO room. The Monaco editor (same editor used in VS Code) emits change events on every keystroke. These are broadcast to all participants in the room, keeping both screens in sync at all times. The collaborative editing layer is backed by Yjs, a CRDT library, with state synced over a separate WebSocket connection.
 
-### Backend (Server)
-- **Runtime**: Node.js with TypeScript.
-- **API**: Express.js for REST endpoints (Auth, Room data, Execution proxy).
-- **Database**: MongoDB with Mongoose ORM for storing user accounts, room sessions, and problem data.
-- **Real-Time Engine**: Socket.IO for handling WebSockets.
-- **Compilation**: Node's `child_process` (`execSync`, `spawn`) for compiling and running C++ test case generators directly on the host machine.
-- **Execution Sandbox**: Piston API for running untrusted user code in isolated environments.
+### Code Execution
+
+When the candidate clicks Run, the client sends a POST request to the server with the current code, language, and problem ID. The server fetches the room's test cases from MongoDB, then sends the candidate's code to the Piston API once per test case — all concurrently. Piston runs the code in an isolated Docker container. The server normalizes line endings in both the actual and expected output before comparing them. Results are emitted back over Socket.IO so both the interviewer and candidate see them simultaneously.
+
+Test cases beyond the first three are hidden from the candidate to prevent hardcoding, similar to how platforms like HackerRank handle it.
+
+### Participant Tracking and Rate Limiting
+
+Participant presence (who is in the room, their role, their socket ID) is stored in Redis with a 24-hour TTL. Chat history is also persisted in Redis. Rate limiting on the execute endpoint uses a Redis key with a 1-second expiry to prevent rapid repeated execution requests.
 
 ---
 
-## 🧩 Key Code Snippets
+## Architecture
 
-### 1. Dynamic C++ Generator Builder (Frontend)
-Instead of forcing interviewers to write `testlib.h` code, the frontend translates UI blocks into C++.
-
-```typescript
-// client/src/utils/generatorBuilder.ts
-export const generateDynamicCpp = (blocks: InputBlock[], hasMultipleTestCases: boolean, tMin: number, tMax: number): string => {
-  let cppCode = `#include "testlib.h"
-#include <iostream>
-#include <vector>
-#include <string>
-
-using namespace std;
-
-void generateTestCase() {
-`;
-
-  blocks.forEach(block => {
-    if (block.type === 'variable') {
-      cppCode += `  int ${block.name} = rnd.next(${block.min}, ${block.max});\n`;
-      cppCode += `  cout << ${block.name} << " ";\n`;
-    } else if (block.type === 'array') {
-      cppCode += `  int ${block.sizeVar} = rnd.next(${block.minSize}, ${block.maxSize});\n`;
-      cppCode += `  cout << ${block.sizeVar} << "\n";\n`;
-      cppCode += `  for(int i=0; i<${block.sizeVar}; i++) { cout << rnd.next(${block.minVal}, ${block.maxVal}) << " "; }\n`;
-      cppCode += `  cout << "\n";\n`;
-    }
-    // ... handles strings, matrices, trees, etc.
-  });
-
-  cppCode += `  cout << "\n";\n}\n\n`;
-  // ... wraps in main() with rnd.setSeed(argc, argv)
-  return cppCode;
-};
 ```
+client/           React + Vite frontend
+  src/
+    pages/        Room, Dashboard, Login, Signup, etc.
+    hooks/        useRoomSocket, useWebRTC
+    utils/        generatorBuilder.ts (JSON schema -> C++ source)
+    components/   TestGeneratorModal, VideoPanel, etc.
 
-### 2. Native Compilation & Execution (Backend)
-The backend securely compiles the generated C++ code, links it against `testlib.h`, and executes it.
+server/           Node.js + Express backend
+  src/
+    config/       MongoDB and Redis connections
+    models/       Room, User, Session, ReplayEvent
+    routes/       auth, rooms, sessions
+    socket/       roomHandler (Socket.IO events)
+    utils/        testlib.h
 
-```typescript
-// server/src/routes/rooms.ts (Snippet)
-import { execSync } from 'child_process';
-import fs from 'fs';
-import path from 'path';
-
-router.post('/:code/generate-testcases', async (req, res) => {
-  const { generatorCode, numCases } = req.body;
-  const tempDir = path.join(__dirname, '../temp');
-  const cppFile = path.join(tempDir, 'generator.cpp');
-  const exeFile = path.join(tempDir, 'generator.exe');
-
-  // Write the frontend-generated code to a file
-  fs.writeFileSync(cppFile, generatorCode);
-
-  try {
-    // Compile using GCC (MSYS2 on Windows)
-    execSync(`g++ -O2 -std=c++17 ${cppFile} -o ${exeFile} -I${path.join(__dirname, '../utils')}`);
-    
-    const testCases = [];
-    for (let i = 0; i < numCases; i++) {
-      // Execute the binary to get random input
-      const input = execSync(`${exeFile} ${Math.random() * 10000}`).toString().trim();
-      testCases.push({ input, expectedOutput: '' });
-    }
-    
-    // ... save to MongoDB
-    res.json({ testCases });
-  } catch (error) {
-    res.status(500).json({ error: 'Compilation failed', details: error.message });
-  }
-});
-```
-
-### 3. Piston API Execution Proxy
-Candidate code is sent to the Piston execution engine.
-
-```typescript
-// server/src/routes/rooms.ts (Snippet)
-const testPromises = testCases.map(async (tc: any) => {
-  // Send code and test case input to Piston
-  const tcRes = await axios.post('http://localhost:2000/api/v2/execute', {
-    language: 'cpp',
-    version: '*',
-    files: [{ name: 'main.cpp', content: candidateCode }],
-    stdin: tc.input
-  }, { timeout: 10000 });
-
-  const runOutput = tcRes.data.run.stdout || tcRes.data.run.stderr;
-  
-  // Normalize Windows \r\n to Linux \n for strict equality comparison
-  const normalizedActual = runOutput.replace(/\r\n/g, '\n').trim();
-  const normalizedExpected = tc.expectedOutput.replace(/\r\n/g, '\n').trim();
-
-  return {
-    input: tc.input,
-    expectedOutput: tc.expectedOutput,
-    actualOutput: runOutput,
-    passed: normalizedActual === normalizedExpected,
-    hidden: false // Logic applied later to hide test cases > 3
-  };
-});
+shared/           TypeScript types shared between client and server
 ```
 
 ---
 
-## 🛠️ Local Development Setup
+## Tech Stack
 
-1. **Clone & Install Dependencies**
-   ```bash
-   # Install backend dependencies
-   cd server
-   npm install
+**Frontend**
+- React 18, Vite, TypeScript
+- Tailwind CSS
+- Monaco Editor (`@monaco-editor/react`)
+- Socket.IO client
+- Yjs + y-websocket (CRDT collaborative editing)
 
-   # Install frontend dependencies
-   cd ../client
-   npm install
-   ```
+**Backend**
+- Node.js, Express, TypeScript
+- MongoDB + Mongoose
+- Socket.IO
+- Redis (Upstash or local) via ioredis
+- Piston API (code execution sandbox)
+- `child_process` with `g++` (test case compilation)
 
-2. **Environment Variables**
-   Create a `.env` file in the `server` directory:
-   ```env
-   PORT=3001
-   MONGO_URI=mongodb://127.0.0.1:27017/codesync
-   JWT_SECRET=your_super_secret_key
-   PISTON_API_URL=http://localhost:2000/api/v2/execute
-   ```
+---
 
-3. **Prerequisites**
-   - **MongoDB**: Must be running locally on port 27017 (or update `MONGO_URI`).
-   - **Piston API**: Needs to be hosted locally or remotely. If local, run via Docker.
-   - **C++ Compiler**: A valid `g++` installation (like MSYS2 on Windows) must be in your system's `PATH` for the native test case generator to compile.
+## Local Setup
 
-4. **Run the Application**
-   Open two terminals:
-   ```bash
-   # Terminal 1: Start Backend (Runs on Port 3001)
-   cd server
-   npm run dev
+**Prerequisites**
+- Node.js 18+
+- MongoDB (local or Atlas)
+- Redis (local or Upstash)
+- Piston API (local via Docker or remote)
+- `g++` in system PATH (required for test case generation only)
 
-   # Terminal 2: Start Frontend (Runs on Port 5173)
-   cd client
-   npm run dev
-   ```
+**Install**
 
-Navigate to `http://localhost:5173` to start syncing!
+```bash
+# From the project root (npm workspaces)
+npm install
+```
+
+**Environment**
+
+`server/.env`:
+```
+PORT=3001
+MONGO_URI=mongodb://127.0.0.1:27017/codesync
+REDIS_URL=redis://localhost:6379
+JWT_SECRET=your_secret
+PISTON_API_URL=http://localhost:2000/api/v2/execute
+```
+
+`client/.env`:
+```
+VITE_API_URL=http://localhost:3001
+```
+
+**Run**
+
+```bash
+npm run dev
+```
+
+This builds the shared package and starts both the server (port 3001) and the client (port 5173) concurrently.
+
+For Piston locally:
+```bash
+docker run -d --privileged -p 2000:2000 ghcr.io/engineer-man/piston
+```
